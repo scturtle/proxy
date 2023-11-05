@@ -1,17 +1,21 @@
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
-use std::net::SocketAddr;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use std::net::{SocketAddr, ToSocketAddrs};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 #[repr(u8)]
 enum Reply {
     Succeeded = 0x0,
-    HostUnreachable = 0x4,
     CommandNotSupported = 0x7,
 }
 
 struct Connection {
     stream: TcpStream,
+}
+
+struct Request {
+    command: u8,
+    address: SocketAddr,
 }
 
 impl Connection {
@@ -23,68 +27,69 @@ impl Connection {
         let buf = [5, 0]; // no auth
         self.stream.write_all(&buf).await
     }
+
     async fn reply(&mut self, reply: Reply) -> IoResult<()> {
         let buf = [5, reply as u8, 0, 1, 0, 0, 0, 0, 0, 0];
         self.stream.write_all(&buf).await
     }
-    async fn shutdown(&mut self) -> IoResult<()> {
-        self.stream.shutdown().await
-    }
-}
 
-enum Address {
-    Socket(SocketAddr),
-    Domain(Vec<u8>, u16),
-}
-
-impl Address {
-    async fn read_from<R: AsyncRead + Unpin>(r: &mut R) -> IoResult<Self> {
-        match r.read_u8().await? {
+    async fn read_addr(&mut self) -> IoResult<SocketAddr> {
+        match self.stream.read_u8().await? {
             0x01 => {
                 let mut buf = [0u8; 4];
-                r.read_exact(&mut buf).await?;
+                self.stream.read_exact(&mut buf).await?;
                 let addr = std::net::Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
-                let port = r.read_u16().await?;
-                Ok(Self::Socket(SocketAddr::from((addr, port))))
+                let port = self.stream.read_u16().await?;
+                Ok(SocketAddr::from((addr, port)))
             }
             0x03 => {
-                let len = r.read_u8().await?;
+                let len = self.stream.read_u8().await?;
                 let mut buf = vec![0u8; len as usize];
-                r.read_exact(&mut buf).await?;
-                let port = r.read_u16().await?;
-                Ok(Self::Domain(buf, port))
+                self.stream.read_exact(&mut buf).await?;
+                let port = self.stream.read_u16().await?;
+                let domain = String::from_utf8_lossy(&buf);
+                let addr = (domain.as_ref(), port)
+                    .to_socket_addrs()?
+                    .next()
+                    .ok_or_else(|| IoError::new(ErrorKind::Other, "failed to resolve DNS"))?;
+                Ok(addr)
             }
             0x04 => {
                 let mut buf = [0u16; 8];
                 for x in &mut buf {
-                    *x = r.read_u16().await?;
+                    *x = self.stream.read_u16().await?;
                 }
                 let addr = std::net::Ipv6Addr::new(
                     buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
                 );
-                let port = r.read_u16().await?;
-                Ok(Self::Socket(SocketAddr::from((addr, port))))
+                let port = self.stream.read_u16().await?;
+                Ok(SocketAddr::from((addr, port)))
             }
             _ => Err(IoError::new(ErrorKind::Other, "unknown address")),
         }
     }
-}
 
-struct Request {
-    command: u8,
-    address: Address,
-}
-
-impl Request {
-    async fn read_from<R: AsyncRead + Unpin>(r: &mut R) -> IoResult<Self> {
-        let ver = r.read_u8().await?;
+    async fn read_request(&mut self) -> IoResult<Request> {
+        let ver = self.stream.read_u8().await?;
         if ver != 5 {
             return Err(IoError::new(ErrorKind::Other, "ver"));
         }
-        let command = r.read_u8().await?;
-        r.read_u8().await?;
-        let address = Address::read_from(r).await?;
-        Ok(Self { command, address })
+        let command = self.stream.read_u8().await?;
+        self.stream.read_u8().await?;
+        let address = self.read_addr().await?;
+        Ok(Request { command, address })
+    }
+
+    async fn handle(&mut self) -> IoResult<()> {
+        self.auth().await?;
+        let request = self.read_request().await?;
+        if request.command != 1 {
+            return self.reply(Reply::CommandNotSupported).await;
+        }
+        let mut target = TcpStream::connect(request.address).await?;
+        self.reply(Reply::Succeeded).await?;
+        let _ = tokio::io::copy_bidirectional(&mut target, &mut self.stream).await;
+        Ok(())
     }
 }
 
@@ -102,39 +107,13 @@ impl Server {
     }
 }
 
-async fn handle(mut conn: Connection) -> IoResult<()> {
-    conn.auth().await?;
-
-    let request = Request::read_from(&mut conn.stream).await?;
-    if request.command != 1 {
-        conn.reply(Reply::CommandNotSupported).await?;
-        return conn.shutdown().await;
-    }
-
-    let target = match request.address {
-        Address::Domain(domain, port) => {
-            let domain = String::from_utf8_lossy(&domain);
-            TcpStream::connect((domain.as_ref(), port)).await
-        }
-        Address::Socket(socket) => TcpStream::connect(socket).await,
-    };
-    let Ok(mut target) = target else {
-        conn.reply(Reply::HostUnreachable).await?;
-        return conn.shutdown().await;
-    };
-
-    conn.reply(Reply::Succeeded).await?;
-    let _ = tokio::io::copy_bidirectional(&mut target, &mut conn.stream).await;
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> IoResult<()> {
     let listener = TcpListener::bind("127.0.0.1:5000").await?;
     let server = Server::new(listener);
-    while let Ok(conn) = server.accept().await {
+    while let Ok(mut conn) = server.accept().await {
         tokio::spawn(async move {
-            match handle(conn).await {
+            match conn.handle().await {
                 Ok(()) => {}
                 Err(err) => eprintln!("{err}"),
             }
