@@ -1,48 +1,48 @@
+use log::error;
 use proxy::read_addr_from;
-
 use rustls::{Certificate, PrivateKey, ServerConfig};
 use rustls_pemfile::Item as KeyItem;
 use sha2::{Digest, Sha224};
 use std::io::{BufReader, Error as IoError, ErrorKind, Result as IoResult};
+use std::net::{SocketAddr, ToSocketAddrs};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
-type TlsStream = tokio_rustls::TlsStream<TcpStream>;
-
-fn load_cert_key(cert: &str, key: &str) -> IoResult<(Vec<Certificate>, PrivateKey)> {
-    let mut reader = BufReader::new(std::fs::File::open(cert)?);
-    let certs = rustls_pemfile::certs(&mut reader)?;
+fn load_cert_key(certfile: &str, keyfile: &str) -> (Vec<Certificate>, PrivateKey) {
+    let mut reader = BufReader::new(std::fs::File::open(certfile).expect("certfile not found"));
+    let certs = rustls_pemfile::certs(&mut reader).expect("parse certfile failed");
     let certs = certs.into_iter().map(Certificate).collect();
-    let mut reader = BufReader::new(std::fs::File::open(key)?);
-    let Some(key) = rustls_pemfile::read_one(&mut reader)? else {
-        return Err(IoError::new(ErrorKind::Other, "private key not found"));
-    };
+    let mut reader = BufReader::new(std::fs::File::open(keyfile).expect("keyfile not found"));
+    let key = rustls_pemfile::read_one(&mut reader)
+        .expect("parse keyfile failed")
+        .expect("no key found");
     let key = match key {
         KeyItem::RSAKey(key) => key,
         KeyItem::PKCS8Key(key) => key,
         KeyItem::ECKey(key) => key,
         _ => {
-            return Err(IoError::new(ErrorKind::Other, "unknown private key type"));
+            panic!("unknown private key type");
         }
     };
     let key = PrivateKey(key);
-    Ok((certs, key))
+    (certs, key)
 }
 
-pub fn make_server_config() -> IoResult<ServerConfig> {
-    let (certs, key) = load_cert_key("cert.pem", "key.pem")?;
-    let cfg = ServerConfig::builder()
+pub fn make_server_config(certfile: &str, keyfile: &str) -> ServerConfig {
+    let (certs, key) = load_cert_key(certfile, keyfile);
+    ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(certs, key)
-        .map_err(|err| IoError::new(ErrorKind::Other, err.to_string()))?;
-    Ok(cfg)
+        .expect("generate server config failed")
 }
 
 struct Connection {
-    stream: TlsStream,
+    stream: tokio_rustls::TlsStream<TcpStream>,
+    client: SocketAddr,
     secret: Vec<u8>,
+    remote: SocketAddr,
 }
 
 impl Connection {
@@ -50,9 +50,8 @@ impl Connection {
         let mut buf = [0u8; 56];
         self.stream.read_exact(&mut buf).await?;
         if buf != self.secret.as_ref() {
-            eprintln!("bad password");
-            let address = std::net::SocketAddr::from((std::net::Ipv4Addr::new(127, 0, 0, 1), 80));
-            let mut target = TcpStream::connect(address).await?;
+            error!("[{}] not authorized", self.client);
+            let mut target = TcpStream::connect(self.remote).await?;
             target.write_all(&buf).await?;
             let _ = tokio::io::copy_bidirectional(&mut target, &mut self.stream).await;
             return Ok(());
@@ -70,28 +69,58 @@ impl Connection {
     }
 }
 
-#[tokio::main]
+use clap::Parser;
+#[derive(Parser)]
+struct Args {
+    #[arg(long, default_value = "127.0.0.1:443")]
+    local: String,
+    #[arg(long, default_value = "127.0.0.1:80")]
+    remote: String,
+    #[arg(long, default_value = "/etc/cert/fullchain.pem")]
+    certfile: String,
+    #[arg(long, default_value = "/etc/cert/key.pem")]
+    keyfile: String,
+    #[arg(long, default_value = "")]
+    secret: String,
+}
+
+#[tokio::main(worker_threads = 4)]
 async fn main() -> IoResult<()> {
-    let server_config = make_server_config()?;
-    let tls_acceptor = TlsAcceptor::from(std::sync::Arc::new(server_config));
-    let listener = TcpListener::bind("127.0.0.1:5000").await?;
-    let secret: Vec<u8> = Sha224::digest("scturtle".as_bytes())
+    env_logger::init();
+
+    let args = std::sync::Arc::new(Args::parse());
+    let remote = args
+        .remote
+        .to_socket_addrs()?
+        .next()
+        .expect("bad remote addr");
+    let secret: Vec<u8> = Sha224::digest(args.secret.as_bytes())
         .iter()
         .flat_map(|x| format!("{:02x}", x).into_bytes())
         .collect();
+
+    let server_config = make_server_config(&args.certfile, &args.keyfile);
+    let tls_acceptor = TlsAcceptor::from(std::sync::Arc::new(server_config));
+    let listener = TcpListener::bind(&args.local).await?;
+
     loop {
-        let (stream, _) = listener.accept().await?;
-        let Ok(stream) = tls_acceptor.accept(stream).await else {
-            eprintln!("not tls");
-            continue;
+        let (stream, client) = listener.accept().await?;
+        let stream = match tls_acceptor.accept(stream).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                error!("[{client}] tls: {err}");
+                continue;
+            }
         };
         let mut conn = Connection {
             stream: tokio_rustls::TlsStream::Server(stream),
+            client,
             secret: secret.clone(),
+            remote,
         };
         tokio::spawn(async move {
             if let Err(err) = conn.handle().await {
-                eprintln!("{err}");
+                error!("[{client}] err: {err}");
             }
         });
     }
