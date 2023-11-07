@@ -1,5 +1,7 @@
+use proxy::read_addr_from;
+
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -33,50 +35,13 @@ impl Connection {
         self.stream.write_all(&buf).await
     }
 
-    async fn read_addr(&mut self) -> IoResult<SocketAddr> {
-        match self.stream.read_u8().await? {
-            0x01 => {
-                let mut buf = [0u8; 4];
-                self.stream.read_exact(&mut buf).await?;
-                let addr = std::net::Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
-                let port = self.stream.read_u16().await?;
-                Ok(SocketAddr::from((addr, port)))
-            }
-            0x03 => {
-                let len = self.stream.read_u8().await?;
-                let mut buf = vec![0u8; len as usize];
-                self.stream.read_exact(&mut buf).await?;
-                let port = self.stream.read_u16().await?;
-                let domain = String::from_utf8_lossy(&buf);
-                let addr = (domain.as_ref(), port)
-                    .to_socket_addrs()?
-                    .next()
-                    .ok_or_else(|| IoError::new(ErrorKind::Other, "failed to resolve DNS"))?;
-                Ok(addr)
-            }
-            0x04 => {
-                let mut buf = [0u16; 8];
-                for x in &mut buf {
-                    *x = self.stream.read_u16().await?;
-                }
-                let addr = std::net::Ipv6Addr::new(
-                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-                );
-                let port = self.stream.read_u16().await?;
-                Ok(SocketAddr::from((addr, port)))
-            }
-            _ => Err(IoError::new(ErrorKind::Other, "unknown address")),
-        }
-    }
-
     async fn read_request(&mut self) -> IoResult<Request> {
-        let ver = self.stream.read_u8().await?;
-        if ver != 5 {
+        if self.stream.read_u8().await? != 5 {
             return Err(IoError::new(ErrorKind::Other, "ver"));
         }
         let command = self.stream.read_u8().await?;
         self.stream.read_u8().await?;
-        let address = self.read_addr().await?;
+        let address = read_addr_from(&mut self.stream).await?;
         Ok(Request { command, address })
     }
 
