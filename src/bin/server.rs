@@ -2,8 +2,9 @@ use proxy::read_addr_from;
 
 use rustls::{Certificate, PrivateKey, ServerConfig};
 use rustls_pemfile::Item as KeyItem;
+use sha2::{Digest, Sha224};
 use std::io::{BufReader, Error as IoError, ErrorKind, Result as IoResult};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
@@ -41,13 +42,21 @@ pub fn make_server_config() -> IoResult<ServerConfig> {
 
 struct Connection {
     stream: TlsStream,
+    secret: Vec<u8>,
 }
 
 impl Connection {
     async fn handle(&mut self) -> IoResult<()> {
         let mut buf = [0u8; 56];
         self.stream.read_exact(&mut buf).await?;
-        // TODO: verify
+        if buf != self.secret.as_ref() {
+            eprintln!("bad password");
+            let address = std::net::SocketAddr::from((std::net::Ipv4Addr::new(127, 0, 0, 1), 80));
+            let mut target = TcpStream::connect(address).await?;
+            target.write_all(&buf).await?;
+            let _ = tokio::io::copy_bidirectional(&mut target, &mut self.stream).await;
+            return Ok(());
+        }
         let _ = self.stream.read_u16().await?;
         let command = self.stream.read_u8().await?;
         if command != 1 {
@@ -66,15 +75,23 @@ async fn main() -> IoResult<()> {
     let server_config = make_server_config()?;
     let tls_acceptor = TlsAcceptor::from(std::sync::Arc::new(server_config));
     let listener = TcpListener::bind("127.0.0.1:5000").await?;
+    let secret: Vec<u8> = Sha224::digest("scturtle".as_bytes())
+        .iter()
+        .flat_map(|x| format!("{:02x}", x).into_bytes())
+        .collect();
     loop {
         let (stream, _) = listener.accept().await?;
-        let stream = tls_acceptor.accept(stream).await?;
-        let stream = tokio_rustls::TlsStream::Server(stream);
-        let mut conn = Connection { stream };
+        let Ok(stream) = tls_acceptor.accept(stream).await else {
+            eprintln!("not tls");
+            continue;
+        };
+        let mut conn = Connection {
+            stream: tokio_rustls::TlsStream::Server(stream),
+            secret: secret.clone(),
+        };
         tokio::spawn(async move {
-            match conn.handle().await {
-                Ok(()) => {}
-                Err(err) => eprintln!("{err}"),
+            if let Err(err) = conn.handle().await {
+                eprintln!("{err}");
             }
         });
     }

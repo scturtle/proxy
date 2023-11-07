@@ -78,9 +78,8 @@ async fn main() -> IoResult<()> {
     let server = Server::new(listener);
     while let Ok(mut conn) = server.accept().await {
         tokio::spawn(async move {
-            match conn.handle().await {
-                Ok(()) => {}
-                Err(err) => eprintln!("{err}"),
+            if let Err(err) = conn.handle().await {
+                eprintln!("{err}");
             }
         });
     }
