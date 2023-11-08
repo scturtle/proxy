@@ -1,5 +1,3 @@
-use proxy::read_addr_from;
-
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,7 +39,8 @@ impl Connection {
         }
         let command = self.stream.read_u8().await?;
         self.stream.read_u8().await?;
-        let address = read_addr_from(&mut self.stream).await?;
+        let address = proxy::Addr::read_addr_from(&mut self.stream).await?;
+        let address = address.try_into()?;
         Ok(Request { command, address })
     }
 

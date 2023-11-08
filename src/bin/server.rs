@@ -1,5 +1,5 @@
 use log::{error, info};
-use proxy::read_addr_from;
+use proxy::Addr;
 use rustls::{Certificate, PrivateKey, ServerConfig};
 use rustls_pemfile::Item as KeyItem;
 use sha2::{Digest, Sha224};
@@ -53,7 +53,7 @@ impl Connection {
         let mut buf = [0u8; 56];
         stream.read_exact(&mut buf).await?;
         if buf != self.secret.as_ref() {
-            error!("[{}] not authorized", client);
+            error!("[{client}] not authorized");
             let mut target = TcpStream::connect(self.remote).await?;
             target.write_all(&buf).await?;
             let _ = tokio::io::copy_bidirectional(&mut target, &mut stream).await;
@@ -62,20 +62,22 @@ impl Connection {
         let _ = stream.read_u16().await?;
         let command = stream.read_u8().await?;
         if command != 1 {
-            let msg = format!("[{}] command({}) != 1", client, command);
+            let msg = format!("[{client}] command({command}) != 1");
             return Err(IoError::new(ErrorKind::Other, msg));
         }
-        let address = read_addr_from(&mut stream).await?;
+        let address = Addr::read_addr_from(&mut stream).await?;
+        info!("[{client}] connect to {address}");
+        let address: SocketAddr = address.try_into()?;
         let _ = stream.read_u16().await?;
         let target = TcpStream::connect(address).await?;
-        info!("[{}] copy bidir", client);
+        info!("[{client}] copy bidir");
         let (mut src_reader, mut src_writer) = tokio::io::split(stream);
         let (mut dst_reader, mut dst_writer) = tokio::io::split(target);
         tokio::select!(
             _ = tokio::io::copy(&mut src_reader, &mut dst_writer) => (),
             _ = tokio::io::copy(&mut dst_reader, &mut src_writer) => (),
         );
-        info!("[{}] copy bidir done", client);
+        info!("[{client}] copy bidir done");
         Ok(())
     }
 }
@@ -117,6 +119,7 @@ async fn main() -> IoResult<()> {
 
     loop {
         let (stream, client) = listener.accept().await?;
+        info!("[{client}] new");
         let stream = match tls_acceptor.accept(stream).await {
             Ok(stream) => stream,
             Err(err) => {
