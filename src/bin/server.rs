@@ -5,9 +5,9 @@ use rustls_pemfile::Item as KeyItem;
 use sha2::{Digest, Sha224};
 use std::io::{BufReader, Error as IoError, ErrorKind, Result as IoResult};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{timeout, Duration};
 use tokio_rustls::TlsAcceptor;
 
 fn load_cert_key(cert: &str, key: &str) -> (Vec<Certificate>, PrivateKey) {
@@ -49,9 +49,9 @@ async fn tcp_copy_bidir<A: AsyncRead + AsyncWrite, B: AsyncRead + AsyncWrite>(a:
 }
 
 struct Connection {
-    stream: tokio_rustls::TlsStream<TcpStream>,
+    stream: tokio_rustls::server::TlsStream<TcpStream>,
     client: SocketAddr,
-    secret: Vec<u8>,
+    secret: Arc<Vec<u8>>,
     remote: SocketAddr,
 }
 
@@ -62,7 +62,7 @@ impl Connection {
         } = self;
         let mut buf = [0u8; 56];
         stream.read_exact(&mut buf).await?;
-        if buf != self.secret.as_ref() {
+        if buf != self.secret.as_slice() {
             error!("[{client}] not authorized");
             let mut target = TcpStream::connect(self.remote).await?;
             target.write_all(&buf).await?;
@@ -117,32 +117,32 @@ async fn main() -> IoResult<()> {
         .iter()
         .flat_map(|x| format!("{:02x}", x).into_bytes())
         .collect();
+    let secret = Arc::new(secret);
 
-    let server_config = make_server_config(&cert, &key);
-    let tls_acceptor = TlsAcceptor::from(std::sync::Arc::new(server_config));
-    let listener = TcpListener::bind(&local).await?;
+    let server_config = Arc::new(make_server_config(&cert, &key));
+    let tls_acceptor = TlsAcceptor::from(server_config);
+    let tcp_listener = TcpListener::bind(&local).await?;
 
     loop {
-        let (stream, client) = listener.accept().await?;
+        let (tcp_stream, client) = tcp_listener.accept().await?;
         info!("[{client}] new");
-        let stream = match timeout(Duration::from_secs(3), tls_acceptor.accept(stream)).await {
-            Err(_) => {
-                error!("[{client}] tls timeout");
-                continue;
-            }
-            Ok(Err(err)) => {
-                error!("[{client}] tls err: {err}");
-                continue;
-            }
-            Ok(Ok(stream)) => stream,
-        };
-        let conn = Connection {
-            stream: tokio_rustls::TlsStream::Server(stream),
-            client,
-            secret: secret.clone(),
-            remote,
-        };
+        let secret = secret.clone();
+        let tls_acceptor = tls_acceptor.clone();
         tokio::spawn(async move {
+            let stream = match tls_acceptor.accept(tcp_stream).await {
+                Err(err) => {
+                    error!("[{client}] tls err: {err}");
+                    return;
+                }
+                Ok(stream) => stream,
+            };
+            info!("[{client}] tls");
+            let conn = Connection {
+                stream,
+                client,
+                secret,
+                remote,
+            };
             if let Err(err) = conn.handle().await {
                 error!("[{client}] err: {err}");
             }
