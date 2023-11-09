@@ -7,6 +7,7 @@ use std::io::{BufReader, Error as IoError, ErrorKind, Result as IoResult};
 use std::net::{SocketAddr, ToSocketAddrs};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{timeout, Duration};
 use tokio_rustls::TlsAcceptor;
 
 fn load_cert_key(cert: &str, key: &str) -> (Vec<Certificate>, PrivateKey) {
@@ -124,12 +125,16 @@ async fn main() -> IoResult<()> {
     loop {
         let (stream, client) = listener.accept().await?;
         info!("[{client}] new");
-        let stream = match tls_acceptor.accept(stream).await {
-            Ok(stream) => stream,
-            Err(err) => {
-                error!("[{client}] tls: {err}");
+        let stream = match timeout(Duration::from_secs(3), tls_acceptor.accept(stream)).await {
+            Err(_) => {
+                error!("[{client}] tls timeout");
                 continue;
             }
+            Ok(Err(err)) => {
+                error!("[{client}] tls err: {err}");
+                continue;
+            }
+            Ok(Ok(stream)) => stream,
         };
         let conn = Connection {
             stream: tokio_rustls::TlsStream::Server(stream),
