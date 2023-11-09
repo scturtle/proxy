@@ -1,6 +1,6 @@
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::net::{SocketAddr, ToSocketAddrs};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub enum Addr {
     Socket(SocketAddr),
@@ -41,6 +41,26 @@ impl Addr {
                 format!("unknown addr type {atyp}"),
             )),
         }
+    }
+    pub async fn write_to<W: AsyncWriteExt + Unpin>(&self, mut w: W) -> IoResult<()> {
+        match self {
+            Self::Socket(SocketAddr::V4(addr)) => {
+                w.write_u8(0x01).await?;
+                w.write_all(&addr.ip().octets()).await?;
+                w.write_u16(addr.port()).await?;
+            }
+            Addr::Socket(SocketAddr::V6(addr)) => {
+                w.write_u8(0x04).await?;
+                w.write_all(&addr.ip().octets()).await?;
+                w.write_u16(addr.port()).await?;
+            }
+            Addr::Domain(buf, port) => {
+                w.write_u8(0x03).await?;
+                w.write_all(buf).await?;
+                w.write_u16(*port).await?;
+            }
+        }
+        Ok(())
     }
 }
 

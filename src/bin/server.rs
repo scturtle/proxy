@@ -7,7 +7,7 @@ use std::io::{BufReader, Error as IoError, ErrorKind, Result as IoResult};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsAcceptor;
 
 fn load_cert_key(cert: &str, key: &str) -> (Vec<Certificate>, PrivateKey) {
@@ -48,6 +48,46 @@ async fn tcp_copy_bidir<A: AsyncRead + AsyncWrite, B: AsyncRead + AsyncWrite>(a:
     );
 }
 
+async fn client_to_udp<R: AsyncRead + Unpin>(mut client: R, target: &UdpSocket) -> IoResult<()> {
+    loop {
+        let address = Addr::read_addr_from(&mut client).await?;
+        let address: SocketAddr = address.try_into()?;
+        let size = client.read_u16().await?;
+        let _ = client.read_u16().await?;
+        let mut buf = vec![0u8; size as usize];
+        if 0 == client.read_exact(&mut buf).await? {
+            return Ok(());
+        }
+        target.send_to(&buf, address).await?;
+    }
+}
+
+async fn udp_to_client<W: AsyncWrite + Unpin>(
+    target: &UdpSocket,
+    mut client: W,
+    addr: Addr,
+) -> IoResult<()> {
+    let mut buf = [0u8; 4096];
+    loop {
+        let size = target.recv(&mut buf).await?;
+        if size == 0 {
+            return Ok(());
+        }
+        addr.write_to(&mut client).await?;
+        client.write_u16(size as u16).await?;
+        client.write_u16(0x0D0A).await?;
+        client.write_all(&buf[..size]).await?;
+    }
+}
+
+async fn udp_copy_bidir<A: AsyncRead + AsyncWrite>(a: A, b: UdpSocket, addr: Addr) {
+    let (mut reader, mut writer) = tokio::io::split(a);
+    tokio::select!(
+        _ = client_to_udp(&mut reader, &b) => (),
+        _ = udp_to_client(&b, &mut writer, addr) => (),
+    );
+}
+
 struct Connection {
     stream: tokio_rustls::server::TlsStream<TcpStream>,
     client: SocketAddr,
@@ -71,19 +111,29 @@ impl Connection {
         }
         let _ = stream.read_u16().await?;
         let command = stream.read_u8().await?;
-        if command != 1 {
-            let msg = format!("[{client}] command({command}) != 1");
-            return Err(IoError::new(ErrorKind::Other, msg));
+        if command == 1 {
+            let address = Addr::read_addr_from(&mut stream).await?;
+            info!("[{client}] tcp to {address}");
+            let address: SocketAddr = address.try_into()?;
+            let _ = stream.read_u16().await?;
+            let target = TcpStream::connect(address).await?;
+            info!("[{client}] tcp bidir");
+            tcp_copy_bidir(target, stream).await;
+            info!("[{client}] tcp bidir done");
+            Ok(())
+        } else if command == 3 {
+            let address = Addr::read_addr_from(&mut stream).await?;
+            info!("[{client}] udp to {address}");
+            let _ = stream.read_u16().await?;
+            let socket = UdpSocket::bind("0.0.0.0:0").await?;
+            info!("[{client}] udp bidir");
+            udp_copy_bidir(stream, socket, address).await;
+            info!("[{client}] udp bidir done");
+            Ok(())
+        } else {
+            let msg = format!("[{client}] unknown command {command}");
+            Err(IoError::new(ErrorKind::Other, msg))
         }
-        let address = Addr::read_addr_from(&mut stream).await?;
-        info!("[{client}] connect to {address}");
-        let address: SocketAddr = address.try_into()?;
-        let _ = stream.read_u16().await?;
-        let target = TcpStream::connect(address).await?;
-        info!("[{client}] copy bidir");
-        tcp_copy_bidir(target, stream).await;
-        info!("[{client}] copy bidir done");
-        Ok(())
     }
 }
 
