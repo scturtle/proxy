@@ -5,7 +5,7 @@ use rustls_pemfile::Item as KeyItem;
 use sha2::{Digest, Sha224};
 use std::io::{BufReader, Error as IoError, ErrorKind, Result as IoResult};
 use std::net::{SocketAddr, ToSocketAddrs};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
@@ -38,6 +38,15 @@ pub fn make_server_config(cert: &str, key: &str) -> ServerConfig {
         .expect("generate server config failed")
 }
 
+async fn tcp_copy_bidir<A: AsyncRead + AsyncWrite, B: AsyncRead + AsyncWrite>(a: A, b: B) {
+    let (mut a_reader, mut a_writer) = tokio::io::split(a);
+    let (mut b_reader, mut b_writer) = tokio::io::split(b);
+    tokio::select!(
+        _ = tokio::io::copy(&mut a_reader, &mut b_writer) => (),
+        _ = tokio::io::copy(&mut b_reader, &mut a_writer) => (),
+    );
+}
+
 struct Connection {
     stream: tokio_rustls::TlsStream<TcpStream>,
     client: SocketAddr,
@@ -56,7 +65,7 @@ impl Connection {
             error!("[{client}] not authorized");
             let mut target = TcpStream::connect(self.remote).await?;
             target.write_all(&buf).await?;
-            let _ = tokio::io::copy_bidirectional(&mut target, &mut stream).await;
+            tcp_copy_bidir(target, stream).await;
             return Ok(());
         }
         let _ = stream.read_u16().await?;
@@ -71,12 +80,7 @@ impl Connection {
         let _ = stream.read_u16().await?;
         let target = TcpStream::connect(address).await?;
         info!("[{client}] copy bidir");
-        let (mut src_reader, mut src_writer) = tokio::io::split(stream);
-        let (mut dst_reader, mut dst_writer) = tokio::io::split(target);
-        tokio::select!(
-            _ = tokio::io::copy(&mut src_reader, &mut dst_writer) => (),
-            _ = tokio::io::copy(&mut dst_reader, &mut src_writer) => (),
-        );
+        tcp_copy_bidir(target, stream).await;
         info!("[{client}] copy bidir done");
         Ok(())
     }
