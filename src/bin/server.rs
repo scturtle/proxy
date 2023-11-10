@@ -40,51 +40,47 @@ pub fn make_server_config(cert: &str, key: &str) -> ServerConfig {
 }
 
 async fn tcp_copy_bidir<A: AsyncRead + AsyncWrite, B: AsyncRead + AsyncWrite>(a: A, b: B) {
-    let (mut a_reader, mut a_writer) = tokio::io::split(a);
-    let (mut b_reader, mut b_writer) = tokio::io::split(b);
+    let (mut a_r, mut a_w) = tokio::io::split(a);
+    let (mut b_r, mut b_w) = tokio::io::split(b);
     tokio::select!(
-        _ = tokio::io::copy(&mut a_reader, &mut b_writer) => (),
-        _ = tokio::io::copy(&mut b_reader, &mut a_writer) => (),
+        _ = tokio::io::copy(&mut a_r, &mut b_w) => (),
+        _ = tokio::io::copy(&mut b_r, &mut a_w) => (),
     );
 }
 
-async fn client_to_udp<R: AsyncRead + Unpin>(mut client: R, target: &UdpSocket) -> IoResult<()> {
+async fn client_to_udp<R: AsyncRead + Unpin>(mut client: R, socket: &UdpSocket) -> IoResult<()> {
     loop {
-        let address = Addr::read_addr_from(&mut client).await?;
-        let address: SocketAddr = address.try_into()?;
+        let addr = Addr::read_addr_from(&mut client).await?;
+        let addr: SocketAddr = addr.try_into()?;
         let size = client.read_u16().await?;
         let _ = client.read_u16().await?;
         let mut buf = vec![0u8; size as usize];
         if 0 == client.read_exact(&mut buf).await? {
             return Ok(());
         }
-        target.send_to(&buf, address).await?;
+        socket.send_to(&buf, addr).await?;
     }
 }
 
-async fn udp_to_client<W: AsyncWrite + Unpin>(
-    target: &UdpSocket,
-    mut client: W,
-    addr: Addr,
-) -> IoResult<()> {
-    let mut buf = [0u8; 4096];
+async fn udp_to_client<W: AsyncWrite + Unpin>(socket: &UdpSocket, mut client: W) -> IoResult<()> {
+    let mut buf = [0u8; 0x4000];
     loop {
-        let size = target.recv(&mut buf).await?;
+        let (size, addr) = socket.recv_from(&mut buf).await?;
         if size == 0 {
             return Ok(());
         }
-        addr.write_to(&mut client).await?;
+        Addr::Socket(addr).write_to(&mut client).await?;
         client.write_u16(size as u16).await?;
         client.write_u16(0x0D0A).await?;
         client.write_all(&buf[..size]).await?;
     }
 }
 
-async fn udp_copy_bidir<A: AsyncRead + AsyncWrite>(a: A, b: UdpSocket, addr: Addr) {
+async fn udp_copy_bidir<A: AsyncRead + AsyncWrite>(a: A, b: UdpSocket) {
     let (mut reader, mut writer) = tokio::io::split(a);
     tokio::select!(
         _ = client_to_udp(&mut reader, &b) => (),
-        _ = udp_to_client(&b, &mut writer, addr) => (),
+        _ = udp_to_client(&b, &mut writer) => (),
     );
 }
 
@@ -111,24 +107,20 @@ impl Connection {
         }
         let _ = stream.read_u16().await?;
         let command = stream.read_u8().await?;
+        let addr = Addr::read_addr_from(&mut stream).await?;
+        let _ = stream.read_u16().await?;
         if command == 1 {
-            let address = Addr::read_addr_from(&mut stream).await?;
-            info!("[{client}] tcp to {address}");
-            let address: SocketAddr = address.try_into()?;
-            let _ = stream.read_u16().await?;
-            let target = TcpStream::connect(address).await?;
-            info!("[{client}] tcp bidir");
+            info!("[{client}] tcp to {addr}");
+            let addr: SocketAddr = addr.try_into()?;
+            let target = TcpStream::connect(addr).await?;
             tcp_copy_bidir(target, stream).await;
-            info!("[{client}] tcp bidir done");
+            info!("[{client}] done");
             Ok(())
         } else if command == 3 {
-            let address = Addr::read_addr_from(&mut stream).await?;
-            info!("[{client}] udp to {address}");
-            let _ = stream.read_u16().await?;
+            info!("[{client}] udp to {addr}");
             let socket = UdpSocket::bind("0.0.0.0:0").await?;
-            info!("[{client}] udp bidir");
-            udp_copy_bidir(stream, socket, address).await;
-            info!("[{client}] udp bidir done");
+            udp_copy_bidir(stream, socket).await;
+            info!("[{client}] done");
             Ok(())
         } else {
             let msg = format!("[{client}] unknown command {command}");
@@ -181,12 +173,11 @@ async fn main() -> IoResult<()> {
         tokio::spawn(async move {
             let stream = match tls_acceptor.accept(tcp_stream).await {
                 Err(err) => {
-                    error!("[{client}] tls err: {err}");
-                    return;
+                    return error!("[{client}] tls err: {err}");
                 }
                 Ok(stream) => stream,
             };
-            info!("[{client}] tls");
+            info!("[{client}] tls ok");
             let conn = Connection {
                 stream,
                 client,
