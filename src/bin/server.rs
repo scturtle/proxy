@@ -30,7 +30,7 @@ fn load_cert_key(cert: &str, key: &str) -> (Vec<Certificate>, PrivateKey) {
     (certs, key)
 }
 
-pub fn make_server_config(cert: &str, key: &str) -> ServerConfig {
+fn make_server_config(cert: &str, key: &str) -> ServerConfig {
     let (certs, key) = load_cert_key(cert, key);
     ServerConfig::builder()
         .with_safe_defaults()
@@ -48,39 +48,39 @@ async fn tcp_copy_bidir<A: AsyncRead + AsyncWrite, B: AsyncRead + AsyncWrite>(a:
     );
 }
 
-async fn client_to_udp<R: AsyncRead + Unpin>(mut client: R, socket: &UdpSocket) -> IoResult<()> {
+async fn client_to_udp<R: AsyncRead + Unpin>(mut client: R, outbound: &UdpSocket) -> IoResult<()> {
     loop {
         let addr = Addr::read_addr_from(&mut client).await?;
-        let addr: SocketAddr = addr.try_into()?;
+        let target: SocketAddr = addr.try_into()?;
         let size = client.read_u16().await?;
         let _ = client.read_u16().await?;
         let mut buf = vec![0u8; size as usize];
         if 0 == client.read_exact(&mut buf).await? {
             return Ok(());
         }
-        socket.send_to(&buf, addr).await?;
+        outbound.send_to(&buf, target).await?;
     }
 }
 
-async fn udp_to_client<W: AsyncWrite + Unpin>(socket: &UdpSocket, mut client: W) -> IoResult<()> {
-    let mut buf = [0u8; 0x4000];
+async fn udp_to_client<W: AsyncWrite + Unpin>(outbound: &UdpSocket, mut client: W) -> IoResult<()> {
+    let mut buffer = [0u8; 0x4000];
     loop {
-        let (size, addr) = socket.recv_from(&mut buf).await?;
+        let (size, addr) = outbound.recv_from(&mut buffer).await?;
         if size == 0 {
             return Ok(());
         }
         Addr::Socket(addr).write_to(&mut client).await?;
         client.write_u16(size as u16).await?;
         client.write_u16(0x0D0A).await?;
-        client.write_all(&buf[..size]).await?;
+        client.write_all(&buffer[..size]).await?;
     }
 }
 
-async fn udp_copy_bidir<A: AsyncRead + AsyncWrite>(a: A, b: UdpSocket) {
+async fn udp_copy_bidir<A: AsyncRead + AsyncWrite>(a: A, outbound: UdpSocket) {
     let (mut reader, mut writer) = tokio::io::split(a);
     tokio::select!(
-        _ = client_to_udp(&mut reader, &b) => (),
-        _ = udp_to_client(&b, &mut writer) => (),
+        _ = client_to_udp(&mut reader, &outbound) => (),
+        _ = udp_to_client(&outbound, &mut writer) => (),
     );
 }
 
@@ -118,8 +118,8 @@ impl Connection {
             Ok(())
         } else if command == 3 {
             info!("[{client}] udp to {addr}");
-            let socket = UdpSocket::bind("0.0.0.0:0").await?;
-            udp_copy_bidir(stream, socket).await;
+            let outbound = UdpSocket::bind("0.0.0.0:0").await?;
+            udp_copy_bidir(stream, outbound).await;
             info!("[{client}] done");
             Ok(())
         } else {
