@@ -10,13 +10,13 @@ futures = "0.3.30"
 log = "0.4.20"
 packet = "0.1.4"
 priority-queue = "1.3.2"
-rustls = "0.21.8"
-rustls-pemfile = "1.0.3"
+rustls = "0.22.1"
+rustls-pemfile = "2.0.0"
 sha2 = "0.10.8"
-smoltcp = "0.10.0"
+smoltcp = "0.11.0"
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 tokio = { version = "1.33.0", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
-tokio-rustls = "0.24.1"
+tokio-rustls = "0.25.0"
 tokio-util = "0.7.10"
 tun = { version = "0.6.1", features = ["async"] }
 tun-tap = "0.1.4"

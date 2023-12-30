@@ -1,7 +1,7 @@
 use log::{error, info};
 use proxy::Addr;
-use rustls::{Certificate, PrivateKey, ServerConfig};
-use rustls_pemfile::Item as KeyItem;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::ServerConfig;
 use sha2::{Digest, Sha224};
 use std::io::{BufReader, Error as IoError, ErrorKind, Result as IoResult};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -10,30 +10,20 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsAcceptor;
 
-fn load_cert_key(cert: &str, key: &str) -> (Vec<Certificate>, PrivateKey) {
-    let mut reader = BufReader::new(std::fs::File::open(cert).expect("cert not found"));
-    let certs = rustls_pemfile::certs(&mut reader).expect("parse cert failed");
-    let certs = certs.into_iter().map(Certificate).collect();
-    let mut reader = BufReader::new(std::fs::File::open(key).expect("key not found"));
-    let key = rustls_pemfile::read_one(&mut reader)
-        .expect("parse key failed")
-        .expect("no key found");
-    let key = match key {
-        KeyItem::RSAKey(key) => key,
-        KeyItem::PKCS8Key(key) => key,
-        KeyItem::ECKey(key) => key,
-        _ => {
-            panic!("unknown private key type");
-        }
-    };
-    let key = PrivateKey(key);
+fn load_cert_key(cert: &str, key: &str) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+    let mut reader = BufReader::new(std::fs::File::open(cert).expect("{cert} not found"));
+    let certs = rustls_pemfile::certs(&mut reader).flatten().collect();
+    let mut reader = BufReader::new(std::fs::File::open(key).expect("{key} not found"));
+    let key = rustls_pemfile::private_key(&mut reader)
+        .ok()
+        .flatten()
+        .expect("key not found in {key}");
     (certs, key)
 }
 
 fn make_server_config(cert: &str, key: &str) -> ServerConfig {
     let (certs, key) = load_cert_key(cert, key);
     ServerConfig::builder()
-        .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .expect("generate server config failed")

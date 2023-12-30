@@ -243,6 +243,9 @@ impl Handle {
                     self.last_rxtx = Instant::now();
                 }
                 Err(udp::RecvError::Exhausted) => {}
+                Err(udp::RecvError::Truncated) => {
+                    log::error!("udp buf too small");
+                }
             },
             Socket::Tcp(sock) => {
                 if sock.can_recv() {
