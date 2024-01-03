@@ -21,8 +21,12 @@ use std::{
     collections::{hash_map::Entry, HashMap, VecDeque},
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc;
-use tokio::time::sleep;
+use tokio::{io::AsyncWriteExt, time::sleep};
+use tokio::{
+    io::{AsyncReadExt, ReadHalf, WriteHalf},
+    net::{TcpSocket, TcpStream},
+    sync::mpsc,
+};
 use tokio_util::codec::Framed;
 use tun::{self, AsyncDevice, Device as TunDevice, TunPacket, TunPacketCodec};
 
@@ -168,6 +172,7 @@ struct Handle {
     endpoint: Option<IpEndpoint>,
     last_rxtx: Instant,
     poll_at: Instant,
+    l4_rx_data: VecDeque<Vec<u8>>,
 }
 
 impl Handle {
@@ -198,6 +203,7 @@ impl Handle {
             endpoint: None,
             last_rxtx: Instant::now(),
             poll_at: Instant::now(),
+            l4_rx_data: Default::default(),
         }
     }
 
@@ -234,12 +240,12 @@ impl Handle {
         }
     }
 
-    fn read(&mut self, l4_rx_data: &mut VecDeque<Vec<u8>>) {
+    fn read(&mut self) {
         match self.socket.as_mut().unwrap() {
             Socket::Udp(sock) => match sock.recv() {
                 Ok((data, udp::UdpMetadata { endpoint, .. })) => {
                     self.endpoint = Some(endpoint);
-                    l4_rx_data.push_back(data.into());
+                    self.l4_rx_data.push_back(data.into());
                     self.last_rxtx = Instant::now();
                 }
                 Err(udp::RecvError::Exhausted) => {}
@@ -250,7 +256,7 @@ impl Handle {
             Socket::Tcp(sock) => {
                 if sock.can_recv() {
                     match sock.recv(|data| {
-                        l4_rx_data.push_back(data.into());
+                        self.l4_rx_data.push_back(data.into());
                         (data.len(), data.len())
                     }) {
                         Ok(_) => {
@@ -303,7 +309,6 @@ impl Handle {
         iface: &mut Interface,
         time: Instant,
         l3_rx_pkt: Option<Vec<u8>>,
-        l4_rx_data: &mut VecDeque<Vec<u8>>,
         l3_tx_sender: mpsc::UnboundedSender<Vec<u8>>,
     ) -> Instant {
         let has_l3_rx = l3_rx_pkt.is_some();
@@ -326,7 +331,7 @@ impl Handle {
 
         // l3_rx => l4_rx
         if has_l3_rx {
-            self.read(l4_rx_data);
+            self.read();
         }
 
         let poll_at = match poll_at {
@@ -344,14 +349,28 @@ impl Handle {
     }
 }
 
+struct External {
+    writer: WriteHalf<TcpStream>,
+    #[allow(dead_code)]
+    shutdown_sender: mpsc::Sender<()>,
+    pending_data: VecDeque<Vec<u8>>,
+}
+
+struct ExternalData {
+    flow: Flow,
+    data: Option<Vec<u8>>,
+}
+
 struct TunProxy {
     device: Framed<AsyncDevice, TunPacketCodec>,
     iface: Interface,
     flows: HashMap<Flow, Handle>,
     polling: PriorityQueue<Flow, Reverse<Instant>>,
-    l4_rx: HashMap<Flow, VecDeque<Vec<u8>>>,
     l3_tx_sender: mpsc::UnboundedSender<Vec<u8>>,
     l3_tx_receiver: mpsc::UnboundedReceiver<Vec<u8>>,
+    externals: HashMap<Flow, External>,
+    external_data_sender: mpsc::Sender<ExternalData>,
+    external_data_receiver: mpsc::Receiver<ExternalData>,
 }
 
 impl TunProxy {
@@ -369,15 +388,18 @@ impl TunProxy {
         iface.set_any_ip(true);
 
         let (l3_tx_sender, l3_tx_receiver) = mpsc::unbounded_channel();
+        let (external_data_sender, external_data_receiver) = mpsc::channel(32);
 
         Self {
             device,
             iface,
             flows: Default::default(),
             polling: Default::default(),
-            l4_rx: Default::default(),
             l3_tx_sender,
             l3_tx_receiver,
+            externals: Default::default(),
+            external_data_sender,
+            external_data_receiver,
         }
     }
 
@@ -426,13 +448,7 @@ impl TunProxy {
                 e.insert(Handle::new(flow))
             }
         };
-        let poll_at = handle.poll(
-            &mut self.iface,
-            now,
-            Some(pkt),
-            self.l4_rx.entry(flow).or_default(),
-            self.l3_tx_sender.clone(),
-        );
+        let poll_at = handle.poll(&mut self.iface, now, Some(pkt), self.l3_tx_sender.clone());
         self.polling.change_priority(&flow, Reverse(poll_at));
         Some(flow)
     }
@@ -441,7 +457,7 @@ impl TunProxy {
         log::info!("remove flow {flow}");
         self.flows.remove(flow);
         self.polling.remove(flow);
-        self.l4_rx.remove(flow);
+        self.externals.remove(flow);
     }
 
     fn poll_all(&mut self) -> Option<Instant> {
@@ -455,13 +471,7 @@ impl TunProxy {
                 // next time to poll
                 return Some(handle.poll_at);
             }
-            let poll_at = handle.poll(
-                &mut self.iface,
-                now,
-                None,
-                self.l4_rx.entry(flow).or_default(),
-                self.l3_tx_sender.clone(),
-            );
+            let poll_at = handle.poll(&mut self.iface, now, None, self.l3_tx_sender.clone());
             self.polling.change_priority(&flow, Reverse(poll_at));
             log::info!("poll_all {} {}", flow, handle.state());
             if handle.last_rxtx.elapsed() > handle.idle_timeout() {
@@ -478,7 +488,6 @@ impl TunProxy {
                 &mut self.iface,
                 Instant::now(),
                 None,
-                self.l4_rx.entry(*flow).or_default(),
                 self.l3_tx_sender.clone(),
             );
             self.polling.change_priority(flow, Reverse(poll_at));
@@ -488,15 +497,83 @@ impl TunProxy {
         }
     }
 
-    async fn transmit_data(&mut self, flow: &Flow) {
-        while let Some(l4_data) = self.l4_rx.get_mut(flow).and_then(|q| q.pop_front()) {
-            if let Some(size) = self.l4_tx(flow, &l4_data).await {
-                if size != l4_data.len() {
-                    // retry later
-                    if let Some(q) = self.l4_rx.get_mut(flow) {
-                        q.push_front(l4_data.into_iter().skip(size).collect());
+    async fn read_from_external(
+        flow: Flow,
+        mut reader: ReadHalf<TcpStream>,
+        sender: mpsc::Sender<ExternalData>,
+        mut shutdown_receiver: mpsc::Receiver<()>,
+    ) {
+        let mut buf = vec![0u8; TCP_BUFSIZE];
+        loop {
+            tokio::select! {
+                size = reader.read(&mut buf) => {
+                    if size.is_err() || size.as_ref().ok() == Some(&0) {
+                        // remote is closed
+                        sender
+                        .send(ExternalData { flow, data: None })
+                        .await
+                        .unwrap();
+                        return;
                     }
+                    let data = Some(buf[..size.unwrap()].to_owned());
+                    sender.send(ExternalData { flow, data }).await.unwrap();
                 }
+                _ = shutdown_receiver.recv() => {
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn transmit_data_to_external(&mut self, flow: &Flow) {
+        while let Some(l4_data) = self
+            .flows
+            .get_mut(flow)
+            .and_then(|handle| handle.l4_rx_data.pop_front())
+        {
+            if !self.externals.contains_key(flow) {
+                let socket = TcpSocket::new_v4().unwrap();
+                let mut host = tokio::net::lookup_host("httpbin.org:80").await.unwrap();
+                let host = host.next().unwrap();
+                let external = socket.connect(host).await.unwrap();
+                let (external_reader, external_writer) = tokio::io::split(external);
+                let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
+                self.externals.insert(
+                    *flow,
+                    External {
+                        writer: external_writer,
+                        shutdown_sender,
+                        pending_data: Default::default(),
+                    },
+                );
+                tokio::spawn(Self::read_from_external(
+                    *flow,
+                    external_reader,
+                    self.external_data_sender.clone(),
+                    shutdown_receiver,
+                ));
+            }
+            let external = self.externals.get_mut(flow).unwrap();
+            external.writer.write_all(&l4_data[..]).await.unwrap();
+        }
+    }
+
+    async fn transmit_external_data(&mut self, flow: &Flow) {
+        while let Some(data) = self
+            .externals
+            .get_mut(flow)
+            .and_then(|e| e.pending_data.pop_front())
+        {
+            let Some(size) = self.l4_tx(flow, &data).await else {
+                break;
+            };
+            if size != data.len() {
+                if let Some(external) = self.externals.get_mut(flow) {
+                    external
+                        .pending_data
+                        .push_front(data.into_iter().skip(size).collect());
+                }
+                break;
             }
         }
     }
@@ -514,11 +591,23 @@ impl TunProxy {
                 Some(Ok(pkt)) = self.device.next() => {
                     log::info!("pkt");
                     if let Some(flow) = self.l3_rx(pkt) {
-                        self.transmit_data(&flow).await;
+                        self.transmit_data_to_external(&flow).await;
+                        self.transmit_external_data(&flow).await;
                     }
                 }
                 Some(pkt) = self.l3_tx_receiver.recv() => {
                     let _ = self.device.send(TunPacket::new(pkt)).await;
+                }
+                Some(ExternalData { flow, data }) = self.external_data_receiver.recv() => {
+                    if let Some(data) = data {
+                        if let Some(external) = self.externals.get_mut(&flow) {
+                            external.pending_data.push_back(data);
+                        }
+                        self.transmit_external_data(&flow).await;
+                    } else {
+                        self.transmit_external_data(&flow).await;
+                        self.remove(&flow);
+                    }
                 }
             }
         }
