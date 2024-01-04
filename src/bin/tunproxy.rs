@@ -1,31 +1,34 @@
 use futures::{SinkExt, StreamExt};
-use priority_queue::PriorityQueue;
 use smoltcp::{
-    iface::{Interface, SocketSet},
+    iface::{Interface, SocketHandle, SocketSet},
     phy::{
         Checksum, ChecksumCapabilities, Device as SmolDevice, DeviceCapabilities, Medium, RxToken,
         TxToken,
     },
     socket::{
         tcp::{self, State as TcpState},
-        udp, Socket,
+        Socket,
     },
-    time::Instant as SmolInstant,
+    storage::RingBuffer,
+    time::{Duration as SmolDuration, Instant as SmolInstant},
     wire::{
-        HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersion,
-        Ipv4Address, Ipv4Packet, Ipv6Address, TcpPacket, UdpPacket,
+        HardwareAddress, IpAddress, IpCidr, IpProtocol, IpVersion, Ipv4Address, Ipv4Packet,
+        Ipv6Address, TcpPacket,
     },
 };
+use spin::mutex::SpinMutex;
 use std::{
-    cmp::Reverse,
-    collections::{hash_map::Entry, HashMap, VecDeque},
+    collections::{HashMap, HashSet},
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll, Waker},
+    thread::{self, Thread},
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
-    net::{TcpSocket, TcpStream},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpSocket,
     sync::mpsc,
-    time::sleep,
 };
 use tokio_util::codec::Framed;
 use tun::{self, AsyncDevice, Device as TunDevice, TunPacket, TunPacketCodec};
@@ -33,11 +36,6 @@ use tun::{self, AsyncDevice, Device as TunDevice, TunPacket, TunPacketCodec};
 const TUN: &str = "utun1989";
 const MTU: usize = 1500;
 const TCP_BUFSIZE: usize = 64 * 1024;
-const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const TCP_HALFOPEN_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const TCP_MAX_SEGMENT_LIFE: Duration = Duration::from_secs(2 * 60);
-const TCP_ESTABLISH_WAIT: Duration = Duration::from_secs(15);
 
 fn capabilities() -> DeviceCapabilities {
     let mut capabilities = DeviceCapabilities::default();
@@ -50,61 +48,30 @@ fn capabilities() -> DeviceCapabilities {
     capabilities
 }
 
-struct DummyDevice {}
+struct VirtDevice {
+    l3_rx_receiver: mpsc::UnboundedReceiver<Vec<u8>>,
+    l3_tx_sender: mpsc::UnboundedSender<Vec<u8>>,
+}
 
-impl SmolDevice for DummyDevice {
-    type RxToken<'a> = DummyRxToken;
-    type TxToken<'a> = DummyTxToken;
-    fn receive(&mut self, _: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        None
-    }
-    fn transmit(&mut self, _: SmolInstant) -> Option<Self::TxToken<'_>> {
-        None
-    }
-    fn capabilities(&self) -> DeviceCapabilities {
-        capabilities()
+impl VirtDevice {
+    fn new(
+        rx_receiver: mpsc::UnboundedReceiver<Vec<u8>>,
+        tx_sender: mpsc::UnboundedSender<Vec<u8>>,
+    ) -> Self {
+        Self {
+            l3_rx_receiver: rx_receiver,
+            l3_tx_sender: tx_sender,
+        }
     }
 }
 
-pub struct DummyRxToken {}
-pub struct DummyTxToken {}
-
-impl RxToken for DummyRxToken {
-    fn consume<R, F>(self, f: F) -> R
-    where
-        F: FnOnce(&mut [u8]) -> R,
-    {
-        f(&mut [])
-    }
-}
-
-impl TxToken for DummyTxToken {
-    fn consume<R, F>(self, _: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8]) -> R,
-    {
-        f(&mut [])
-    }
-}
-
-struct PacketQ {
-    rx_pkt: Option<Vec<u8>>,
-    tx_sender: mpsc::UnboundedSender<Vec<u8>>,
-}
-
-impl PacketQ {
-    fn new(rx_pkt: Option<Vec<u8>>, tx_sender: mpsc::UnboundedSender<Vec<u8>>) -> Self {
-        Self { rx_pkt, tx_sender }
-    }
-}
-
-impl SmolDevice for PacketQ {
+impl SmolDevice for VirtDevice {
     type RxToken<'a> = PqRxToken where Self: 'a;
     type TxToken<'a> = PqTxToken<'a> where Self: 'a;
 
     fn receive(&mut self, _: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if let Some(rx_pkt) = self.rx_pkt.take() {
-            let rx = PqRxToken { rx_pkt };
+        if let Ok(pkt) = self.l3_rx_receiver.try_recv() {
+            let rx = PqRxToken { pkt };
             let tx = PqTxToken(self);
             Some((rx, tx))
         } else {
@@ -122,7 +89,7 @@ impl SmolDevice for PacketQ {
 }
 
 struct PqRxToken {
-    rx_pkt: Vec<u8>,
+    pkt: Vec<u8>,
 }
 
 impl RxToken for PqRxToken {
@@ -130,11 +97,11 @@ impl RxToken for PqRxToken {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        f(self.rx_pkt.as_mut_slice())
+        f(self.pkt.as_mut_slice())
     }
 }
 
-struct PqTxToken<'a>(&'a mut PacketQ);
+struct PqTxToken<'a>(&'a mut VirtDevice);
 
 impl<'a> TxToken for PqTxToken<'a> {
     fn consume<R, F>(self, len: usize, f: F) -> R
@@ -143,7 +110,7 @@ impl<'a> TxToken for PqTxToken<'a> {
     {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
-        let _ = self.0.tx_sender.send(buffer); // l3_tx()
+        let _ = self.0.l3_tx_sender.send(buffer);
         result
     }
 }
@@ -167,219 +134,169 @@ impl std::fmt::Display for Flow {
     }
 }
 
-struct Handle {
-    socket: Option<Socket<'static>>,
-    endpoint: Option<IpEndpoint>,
+struct Control {
+    send_buffer: RingBuffer<'static, u8>,
+    send_waker: Option<Waker>,
+    recv_buffer: RingBuffer<'static, u8>,
+    recv_waker: Option<Waker>,
     last_rxtx: Instant,
-    poll_at: Instant,
-    l4_rx_data: VecDeque<Vec<u8>>,
+    polling_thread: Thread,
 }
 
-impl Handle {
-    fn new(flow: Flow) -> Self {
-        let socket = if flow.protocol == IpProtocol::Tcp {
-            let rx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFSIZE]);
-            let tx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFSIZE]);
-            let mut socket = tcp::Socket::new(rx, tx);
-            socket.listen(flow.dest_port).expect("tcp listen");
-            Some(Socket::Tcp(socket))
-        } else {
-            assert_eq!(flow.protocol, IpProtocol::Udp);
-            let rxm = vec![udp::PacketMetadata::EMPTY; 1];
-            let txm = vec![udp::PacketMetadata::EMPTY; 1];
-            let rx = udp::PacketBuffer::new(rxm, vec![0u8; 2 * MTU]);
-            let tx = udp::PacketBuffer::new(txm, vec![0u8; 2 * MTU]);
-            let mut socket = udp::Socket::new(rx, tx);
-            socket
-                .bind(IpListenEndpoint {
-                    addr: Some(flow.dest_ip),
-                    port: flow.dest_port,
-                })
-                .expect("udp bind");
-            Some(Socket::Udp(socket))
-        };
+impl Control {
+    fn new(polling_thread: Thread) -> Self {
         Self {
-            socket,
-            endpoint: None,
+            send_buffer: RingBuffer::new(vec![0u8; 4 * TCP_BUFSIZE]),
+            send_waker: None,
+            recv_buffer: RingBuffer::new(vec![0u8; 4 * TCP_BUFSIZE]),
+            recv_waker: None,
             last_rxtx: Instant::now(),
-            poll_at: Instant::now(),
-            l4_rx_data: Default::default(),
+            polling_thread,
         }
-    }
-
-    fn idle_timeout(&self) -> Duration {
-        match &self.socket {
-            Some(Socket::Tcp(sock)) => match sock.state() {
-                TcpState::Established => TCP_IDLE_TIMEOUT,
-                TcpState::TimeWait => TCP_MAX_SEGMENT_LIFE,
-                TcpState::Listen | TcpState::SynReceived | TcpState::SynSent | TcpState::Closed => {
-                    TCP_ESTABLISH_WAIT
-                }
-                TcpState::CloseWait
-                | TcpState::FinWait1
-                | TcpState::FinWait2
-                | TcpState::LastAck
-                | TcpState::Closing => TCP_HALFOPEN_IDLE_TIMEOUT,
-            },
-            Some(Socket::Udp(_)) => UDP_IDLE_TIMEOUT,
-            _ => UDP_IDLE_TIMEOUT,
-        }
-    }
-
-    #[allow(dead_code)]
-    fn close(&mut self) {
-        if let Some(Socket::Tcp(sock)) = &mut self.socket {
-            sock.close()
-        }
-    }
-
-    #[allow(dead_code)]
-    fn state(&self) -> TcpState {
-        match &self.socket {
-            Some(Socket::Tcp(sock)) => sock.state(),
-            _ => TcpState::Established,
-        }
-    }
-
-    fn read(&mut self) {
-        match self.socket.as_mut().unwrap() {
-            Socket::Udp(sock) => match sock.recv() {
-                Ok((data, udp::UdpMetadata { endpoint, .. })) => {
-                    self.endpoint = Some(endpoint);
-                    self.l4_rx_data.push_back(data.into());
-                    self.last_rxtx = Instant::now();
-                }
-                Err(udp::RecvError::Exhausted) => {}
-                Err(udp::RecvError::Truncated) => {
-                    log::error!("udp buf too small");
-                }
-            },
-            Socket::Tcp(sock) => {
-                if sock.can_recv() {
-                    match sock.recv(|data| {
-                        self.l4_rx_data.push_back(data.into());
-                        (data.len(), data.len())
-                    }) {
-                        Ok(_) => {
-                            self.last_rxtx = Instant::now();
-                        }
-                        Err(_) => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn write(&mut self, data: &[u8]) -> Option<usize> {
-        match self.socket.as_mut().unwrap() {
-            Socket::Udp(sock) => {
-                let Some(endpoint) = self.endpoint.as_ref() else {
-                    return None;
-                };
-                match sock.send_slice(data, *endpoint) {
-                    Ok(()) => {
-                        self.last_rxtx = Instant::now();
-                        Some(data.len())
-                    }
-                    Err(udp::SendError::BufferFull) => Some(0),
-                    Err(udp::SendError::Unaddressable) => None,
-                }
-            }
-            Socket::Tcp(sock) => {
-                if sock.can_send() {
-                    match sock.send_slice(data) {
-                        Ok(size) => {
-                            if size > 0 {
-                                self.last_rxtx = Instant::now();
-                            }
-                            Some(size)
-                        }
-                        Err(tcp::SendError::InvalidState) => None,
-                    }
-                } else {
-                    Some(0)
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn poll(
-        &mut self,
-        iface: &mut Interface,
-        time: Instant,
-        l3_rx_pkt: Option<Vec<u8>>,
-        l3_tx_sender: mpsc::UnboundedSender<Vec<u8>>,
-    ) -> Instant {
-        let has_l3_rx = l3_rx_pkt.is_some();
-        let mut pktq = PacketQ::new(l3_rx_pkt, l3_tx_sender);
-        let mut socket_set = SocketSet::new(vec![]);
-        let handle = match self.socket.take().unwrap() {
-            Socket::Udp(sock) => socket_set.add(sock),
-            Socket::Tcp(sock) => socket_set.add(sock),
-            _ => {
-                unreachable!()
-            }
-        };
-        let smol_time: SmolInstant = time.into();
-        let mut poll_at = Some(smol_time);
-        let changed = iface.poll(smol_time, &mut pktq, &mut socket_set);
-        if !changed {
-            poll_at = iface.poll_at(smol_time, &socket_set);
-        }
-        self.socket = Some(socket_set.remove(handle));
-
-        // l3_rx => l4_rx
-        if has_l3_rx {
-            self.read();
-        }
-
-        let poll_at = match poll_at {
-            Some(poll_at) => {
-                if poll_at == SmolInstant::ZERO {
-                    time // now
-                } else {
-                    time + (poll_at - smol_time).into()
-                }
-            }
-            None => time + self.idle_timeout(),
-        };
-        self.poll_at = poll_at;
-        poll_at
     }
 }
 
-struct External {
-    writer: WriteHalf<TcpStream>,
-    #[allow(dead_code)]
-    shutdown_sender: mpsc::Sender<()>,
-    data: VecDeque<Vec<u8>>,
-}
-
-struct ExternalData {
+#[derive(Clone)]
+struct Connection {
     flow: Flow,
-    data: Option<Vec<u8>>,
+    control: Arc<SpinMutex<Control>>,
+}
+
+impl Connection {
+    fn new(flow: Flow, polling_thread: Thread) -> Self {
+        let control = Arc::new(SpinMutex::new(Control::new(polling_thread)));
+        Self { flow, control }
+    }
+}
+
+impl AsyncRead for Connection {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let mut control = self.control.lock();
+        if control.recv_buffer.is_empty() {
+            if let Some(old_waker) = control.recv_waker.replace(cx.waker().clone()) {
+                if !old_waker.will_wake(cx.waker()) {
+                    old_waker.wake();
+                }
+            }
+            return Poll::Pending;
+        }
+        let n = control.recv_buffer.dequeue_slice(buf.initialize_unfilled());
+        buf.advance(n);
+        // log::info!("socket => external ({n})");
+        control.last_rxtx = Instant::now();
+        control.polling_thread.unpark();
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for Connection {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut control = self.control.lock();
+        if control.send_buffer.is_full() {
+            if let Some(old_waker) = control.send_waker.replace(cx.waker().clone()) {
+                if !old_waker.will_wake(cx.waker()) {
+                    old_waker.wake();
+                }
+            }
+            return Poll::Pending;
+        }
+        let n = control.send_buffer.enqueue_slice(buf);
+        // log::info!("external => socket ({n})");
+        control.last_rxtx = Instant::now();
+        control.polling_thread.unpark();
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+fn idle_timeout(state: TcpState) -> Duration {
+    const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+    const TCP_HALFOPEN_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+    const TCP_MAX_SEGMENT_LIFE: Duration = Duration::from_secs(2 * 60);
+    const TCP_ESTABLISH_WAIT: Duration = Duration::from_secs(15);
+    match state {
+        TcpState::Established => TCP_IDLE_TIMEOUT,
+        TcpState::TimeWait => TCP_MAX_SEGMENT_LIFE,
+        TcpState::Listen | TcpState::SynReceived | TcpState::SynSent | TcpState::Closed => {
+            TCP_ESTABLISH_WAIT
+        }
+        TcpState::CloseWait
+        | TcpState::FinWait1
+        | TcpState::FinWait2
+        | TcpState::LastAck
+        | TcpState::Closing => TCP_HALFOPEN_IDLE_TIMEOUT,
+    }
+}
+
+async fn tcp_copy_bidir<A: AsyncRead + AsyncWrite, B: AsyncRead + AsyncWrite>(a: A, b: B) {
+    let (mut a_r, mut a_w) = tokio::io::split(a);
+    let (mut b_r, mut b_w) = tokio::io::split(b);
+    tokio::select!(
+        _ = tokio::io::copy(&mut a_r, &mut b_w) => (),
+        _ = tokio::io::copy(&mut b_r, &mut a_w) => (),
+    );
 }
 
 struct TunProxy {
     device: Framed<AsyncDevice, TunPacketCodec>,
-    iface: Interface,
-    flows: HashMap<Flow, Handle>,
-    polling: PriorityQueue<Flow, Reverse<Instant>>,
-    l3_tx_sender: mpsc::UnboundedSender<Vec<u8>>,
+    l3_rx_sender: mpsc::UnboundedSender<Vec<u8>>,
     l3_tx_receiver: mpsc::UnboundedReceiver<Vec<u8>>,
-    externals: HashMap<Flow, External>,
-    external_data_sender: mpsc::Sender<ExternalData>,
-    external_data_receiver: mpsc::Receiver<ExternalData>,
+    socket_set: Arc<SpinMutex<SocketSet<'static>>>,
+    flows: Arc<SpinMutex<HashSet<Flow>>>,
+    connections: Arc<SpinMutex<HashMap<SocketHandle, Connection>>>,
+    polling_thread: Thread,
 }
 
 impl TunProxy {
     fn new(device: Framed<AsyncDevice, TunPacketCodec>) -> Self {
+        let (l3_rx_sender, l3_rx_receiver) = mpsc::unbounded_channel();
+        let (l3_tx_sender, l3_tx_receiver) = mpsc::unbounded_channel();
+        let virt_device = VirtDevice::new(l3_rx_receiver, l3_tx_sender);
+
+        let socket_set = Arc::new(SpinMutex::new(SocketSet::new(vec![])));
+        let flows = Arc::new(SpinMutex::new(HashSet::new()));
+        let connections = Arc::new(SpinMutex::new(HashMap::new()));
+
+        let polling_thread = {
+            let socket_set = socket_set.clone();
+            let flows = flows.clone();
+            let connections = connections.clone();
+            thread::spawn(move || Self::polling(virt_device, socket_set, flows, connections))
+                .thread()
+                .clone()
+        };
+
+        Self {
+            device,
+            l3_rx_sender,
+            l3_tx_receiver,
+            polling_thread,
+            socket_set,
+            flows,
+            connections,
+        }
+    }
+
+    fn create_interface(virt_device: &mut VirtDevice) -> Interface {
+        let iface_config = smoltcp::iface::Config::new(HardwareAddress::Ip);
+        let mut iface = Interface::new(iface_config, virt_device, SmolInstant::now());
         let dummy_v4 = Ipv4Address::new(0, 0, 0, 1);
         let dummy_v6 = Ipv6Address::new(0, 0, 0, 0, 0, 0, 0, 1);
-        let iface_config = smoltcp::iface::Config::new(HardwareAddress::Ip);
-        let mut iface = Interface::new(iface_config, &mut DummyDevice {}, SmolInstant::now());
         iface.update_ip_addrs(|ip_addrs| {
             ip_addrs.push(IpCidr::new(dummy_v4.into(), 0)).unwrap();
             ip_addrs.push(IpCidr::new(dummy_v6.into(), 0)).unwrap()
@@ -387,20 +304,86 @@ impl TunProxy {
         iface.routes_mut().add_default_ipv4_route(dummy_v4).unwrap();
         iface.routes_mut().add_default_ipv6_route(dummy_v6).unwrap();
         iface.set_any_ip(true);
+        iface
+    }
 
-        let (l3_tx_sender, l3_tx_receiver) = mpsc::unbounded_channel();
-        let (external_data_sender, external_data_receiver) = mpsc::channel(32);
+    fn polling(
+        mut virt_device: VirtDevice,
+        socket_set: Arc<SpinMutex<SocketSet<'static>>>,
+        flows: Arc<SpinMutex<HashSet<Flow>>>,
+        connections: Arc<SpinMutex<HashMap<SocketHandle, Connection>>>,
+    ) {
+        let mut iface = Self::create_interface(&mut virt_device);
+        loop {
+            let before_poll = SmolInstant::now();
+            let updated = iface.poll(before_poll, &mut virt_device, &mut socket_set.lock());
+            // log::info!("poll {updated}");
+            {
+                let mut socket_set = socket_set.lock();
+                let mut flows = flows.lock();
+                let mut connections = connections.lock();
+                let mut to_removed = vec![];
+                for (handle, socket) in socket_set.iter_mut() {
+                    let mut control = connections.get_mut(&handle).unwrap().control.lock();
+                    match socket {
+                        Socket::Tcp(socket) => {
+                            let mut wake_receiver = false;
+                            while socket.can_recv() && !control.recv_buffer.is_full() {
+                                wake_receiver = true;
+                                let Ok(_) = socket.recv(|buffer| {
+                                    let n = control.recv_buffer.enqueue_slice(buffer);
+                                    (n, ())
+                                }) else {
+                                    break;
+                                };
+                                // log::info!("iface => socket {result:?}");
+                            }
+                            if wake_receiver {
+                                if let Some(waker) = control.recv_waker.take() {
+                                    waker.wake();
+                                }
+                            }
 
-        Self {
-            device,
-            iface,
-            flows: Default::default(),
-            polling: Default::default(),
-            l3_tx_sender,
-            l3_tx_receiver,
-            externals: Default::default(),
-            external_data_sender,
-            external_data_receiver,
+                            let mut wake_sender = false;
+                            while socket.can_send() && !control.send_buffer.is_empty() {
+                                wake_sender = true;
+                                let Ok(_) = socket.send(|buffer| {
+                                    let n = control.send_buffer.dequeue_slice(buffer);
+                                    (n, ())
+                                }) else {
+                                    break;
+                                };
+                                // log::info!("socket => iface {result:?}");
+                            }
+                            if wake_sender {
+                                if let Some(waker) = control.send_waker.take() {
+                                    waker.wake();
+                                }
+                            }
+
+                            if control.last_rxtx.elapsed() > idle_timeout(socket.state()) {
+                                to_removed.push(handle);
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+
+                for handle in to_removed {
+                    socket_set.remove(handle);
+                    flows.remove(&connections[&handle].flow);
+                    connections.remove(&handle);
+                }
+            }
+
+            if !updated {
+                let duration = iface
+                    .poll_delay(before_poll, &socket_set.lock())
+                    .unwrap_or(SmolDuration::from_millis(1000));
+                if duration != SmolDuration::ZERO {
+                    thread::park_timeout(duration.into());
+                }
+            }
         }
     }
 
@@ -422,14 +405,7 @@ impl TunProxy {
                         })
                     }
                     IpProtocol::Udp => {
-                        let udp_packet = UdpPacket::new_checked(packet.payload()).ok()?;
-                        Some(Flow {
-                            source_ip,
-                            source_port: udp_packet.src_port(),
-                            dest_ip,
-                            dest_port: udp_packet.dst_port(),
-                            protocol: IpProtocol::Udp,
-                        })
+                        None // TODO
                     }
                     _ => None,
                 }
@@ -438,175 +414,45 @@ impl TunProxy {
         }
     }
 
-    fn l3_rx(&mut self, pkt: TunPacket) -> Option<Flow> {
+    async fn process_frame(&mut self, pkt: TunPacket) {
         let pkt: Vec<u8> = pkt.into_bytes().into_iter().collect();
-        let now = Instant::now();
-        let flow = Self::l3_parse(&pkt)?;
-        let handle: &mut Handle = match self.flows.entry(flow) {
-            Entry::Occupied(o) => o.into_mut(),
-            Entry::Vacant(e) => {
-                self.polling.push(flow, Reverse(now));
-                e.insert(Handle::new(flow))
-            }
+        let Some(flow) = Self::l3_parse(&pkt) else {
+            return;
         };
-        let poll_at = handle.poll(&mut self.iface, now, Some(pkt), self.l3_tx_sender.clone());
-        self.polling.change_priority(&flow, Reverse(poll_at));
-        Some(flow)
-    }
-
-    fn remove(&mut self, flow: &Flow) {
-        log::info!("remove flow {flow}");
-        self.flows.remove(flow);
-        self.polling.remove(flow);
-        self.externals.remove(flow);
-    }
-
-    fn poll_all(&mut self) -> Option<Instant> {
-        let now = Instant::now();
-        loop {
-            let Some((&flow, _)) = self.polling.peek() else {
-                return None;
+        if !self.flows.lock().contains(&flow) {
+            log::info!("{flow}");
+            let socket = {
+                let rx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFSIZE]);
+                let tx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFSIZE]);
+                let mut socket = tcp::Socket::new(rx, tx);
+                socket.listen(flow.dest_port).expect("tcp listen");
+                socket
             };
-            let handle = self.flows.get_mut(&flow).expect("handle not found");
-            if handle.poll_at > now {
-                // next time to poll
-                return Some(handle.poll_at);
-            }
-            let poll_at = handle.poll(&mut self.iface, now, None, self.l3_tx_sender.clone());
-            self.polling.change_priority(&flow, Reverse(poll_at));
-            // log::info!("poll_all {} {}", flow, handle.state());
-            if handle.last_rxtx.elapsed() > handle.idle_timeout() {
-                self.remove(&flow);
-            }
-        }
-    }
+            let socket_handle = self.socket_set.lock().add(socket);
+            let connection = Connection::new(flow, self.polling_thread.clone());
+            let conn = connection.clone();
+            self.flows.lock().insert(flow);
+            self.connections.lock().insert(socket_handle, connection);
 
-    async fn l4_tx(&mut self, flow: &Flow, l4_data: &[u8]) -> Option<usize> {
-        if let Some(handle) = self.flows.get_mut(flow) {
-            // l4_tx => l3_tx
-            let ret = handle.write(l4_data);
-            let poll_at = handle.poll(
-                &mut self.iface,
-                Instant::now(),
-                None,
-                self.l3_tx_sender.clone(),
-            );
-            self.polling.change_priority(flow, Reverse(poll_at));
-            ret
-        } else {
-            None
+            // FIXME: redirect to httpbin.org
+            let socket = TcpSocket::new_v4().unwrap();
+            let mut host = tokio::net::lookup_host("httpbin.org:80").await.unwrap();
+            let host = host.next().unwrap();
+            let stream = socket.connect(host).await.unwrap();
+            tokio::spawn(tcp_copy_bidir(conn, stream));
         }
-    }
-
-    async fn read_from_external(
-        flow: Flow,
-        mut reader: ReadHalf<TcpStream>,
-        sender: mpsc::Sender<ExternalData>,
-        mut shutdown_receiver: mpsc::Receiver<()>,
-    ) {
-        let mut buf = vec![0u8; TCP_BUFSIZE];
-        loop {
-            tokio::select! {
-                size = reader.read(&mut buf) => {
-                    if size.is_err() || size.as_ref().ok() == Some(&0) {
-                        // remote is closed
-                        sender
-                        .send(ExternalData { flow, data: None })
-                        .await
-                        .unwrap();
-                        return;
-                    }
-                    let data = Some(buf[..size.unwrap()].to_owned());
-                    sender.send(ExternalData { flow, data }).await.unwrap();
-                }
-                _ = shutdown_receiver.recv() => {
-                    return;
-                }
-            }
-        }
-    }
-
-    async fn transmit_data_to_external(&mut self, flow: &Flow) {
-        while let Some(l4_data) = self
-            .flows
-            .get_mut(flow)
-            .and_then(|handle| handle.l4_rx_data.pop_front())
-        {
-            if !self.externals.contains_key(flow) {
-                let socket = TcpSocket::new_v4().unwrap();
-                let mut host = tokio::net::lookup_host("httpbin.org:80").await.unwrap();
-                let host = host.next().unwrap();
-                let external = socket.connect(host).await.unwrap();
-                let (external_reader, external_writer) = tokio::io::split(external);
-                let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
-                self.externals.insert(
-                    *flow,
-                    External {
-                        writer: external_writer,
-                        shutdown_sender,
-                        data: Default::default(),
-                    },
-                );
-                tokio::spawn(Self::read_from_external(
-                    *flow,
-                    external_reader,
-                    self.external_data_sender.clone(),
-                    shutdown_receiver,
-                ));
-            }
-            let external = self.externals.get_mut(flow).unwrap();
-            external.writer.write_all(&l4_data[..]).await.unwrap();
-        }
-    }
-
-    async fn transmit_external_data(&mut self, flow: &Flow) {
-        while let Some(data) = self
-            .externals
-            .get_mut(flow)
-            .and_then(|e| e.data.pop_front())
-        {
-            let Some(size) = self.l4_tx(flow, &data).await else {
-                break;
-            };
-            if size != data.len() {
-                if let Some(external) = self.externals.get_mut(flow) {
-                    external
-                        .data
-                        .push_front(data.into_iter().skip(size).collect());
-                }
-                break;
-            }
-        }
+        self.l3_rx_sender.send(pkt).unwrap();
+        self.polling_thread.unpark();
     }
 
     async fn run(&mut self) {
         loop {
-            let wakeup = match self.poll_all() {
-                Some(wakeup) => wakeup,
-                None => Instant::now() + Duration::from_secs(86400),
-            };
             tokio::select! {
-                _ = sleep(wakeup - Instant::now()) => {
+                Some(pkt) = self.l3_tx_receiver.recv() => {
+                    self.device.send(TunPacket::new(pkt)).await.unwrap();
                 }
                 Some(Ok(pkt)) = self.device.next() => {
-                    if let Some(flow) = self.l3_rx(pkt) {
-                        self.transmit_data_to_external(&flow).await;
-                        self.transmit_external_data(&flow).await;
-                    }
-                }
-                Some(pkt) = self.l3_tx_receiver.recv() => {
-                    let _ = self.device.send(TunPacket::new(pkt)).await;
-                }
-                Some(ExternalData { flow, data }) = self.external_data_receiver.recv() => {
-                    if let Some(data) = data {
-                        if let Some(external) = self.externals.get_mut(&flow) {
-                            external.data.push_back(data);
-                        }
-                        self.transmit_external_data(&flow).await;
-                    } else {
-                        self.transmit_external_data(&flow).await;
-                        self.remove(&flow);
-                    }
+                    self.process_frame(pkt).await;
                 }
             }
         }
