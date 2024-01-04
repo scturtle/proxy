@@ -21,11 +21,11 @@ use std::{
     collections::{hash_map::Entry, HashMap, VecDeque},
     time::{Duration, Instant},
 };
-use tokio::{io::AsyncWriteExt, time::sleep};
 use tokio::{
-    io::{AsyncReadExt, ReadHalf, WriteHalf},
+    io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
     net::{TcpSocket, TcpStream},
     sync::mpsc,
+    time::sleep,
 };
 use tokio_util::codec::Framed;
 use tun::{self, AsyncDevice, Device as TunDevice, TunPacket, TunPacketCodec};
@@ -233,6 +233,7 @@ impl Handle {
         }
     }
 
+    #[allow(dead_code)]
     fn state(&self) -> TcpState {
         match &self.socket {
             Some(Socket::Tcp(sock)) => sock.state(),
@@ -353,7 +354,7 @@ struct External {
     writer: WriteHalf<TcpStream>,
     #[allow(dead_code)]
     shutdown_sender: mpsc::Sender<()>,
-    pending_data: VecDeque<Vec<u8>>,
+    data: VecDeque<Vec<u8>>,
 }
 
 struct ExternalData {
@@ -473,7 +474,7 @@ impl TunProxy {
             }
             let poll_at = handle.poll(&mut self.iface, now, None, self.l3_tx_sender.clone());
             self.polling.change_priority(&flow, Reverse(poll_at));
-            log::info!("poll_all {} {}", flow, handle.state());
+            // log::info!("poll_all {} {}", flow, handle.state());
             if handle.last_rxtx.elapsed() > handle.idle_timeout() {
                 self.remove(&flow);
             }
@@ -543,7 +544,7 @@ impl TunProxy {
                     External {
                         writer: external_writer,
                         shutdown_sender,
-                        pending_data: Default::default(),
+                        data: Default::default(),
                     },
                 );
                 tokio::spawn(Self::read_from_external(
@@ -562,7 +563,7 @@ impl TunProxy {
         while let Some(data) = self
             .externals
             .get_mut(flow)
-            .and_then(|e| e.pending_data.pop_front())
+            .and_then(|e| e.data.pop_front())
         {
             let Some(size) = self.l4_tx(flow, &data).await else {
                 break;
@@ -570,7 +571,7 @@ impl TunProxy {
             if size != data.len() {
                 if let Some(external) = self.externals.get_mut(flow) {
                     external
-                        .pending_data
+                        .data
                         .push_front(data.into_iter().skip(size).collect());
                 }
                 break;
@@ -586,10 +587,8 @@ impl TunProxy {
             };
             tokio::select! {
                 _ = sleep(wakeup - Instant::now()) => {
-                    log::info!("wake");
                 }
                 Some(Ok(pkt)) = self.device.next() => {
-                    log::info!("pkt");
                     if let Some(flow) = self.l3_rx(pkt) {
                         self.transmit_data_to_external(&flow).await;
                         self.transmit_external_data(&flow).await;
@@ -601,7 +600,7 @@ impl TunProxy {
                 Some(ExternalData { flow, data }) = self.external_data_receiver.recv() => {
                     if let Some(data) = data {
                         if let Some(external) = self.externals.get_mut(&flow) {
-                            external.pending_data.push_back(data);
+                            external.data.push_back(data);
                         }
                         self.transmit_external_data(&flow).await;
                     } else {
