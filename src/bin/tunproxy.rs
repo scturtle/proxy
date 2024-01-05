@@ -19,6 +19,7 @@ use smoltcp::{
 use spin::mutex::SpinMutex;
 use std::{
     collections::{HashMap, HashSet},
+    io::{Error as IoError, ErrorKind as IoErrorKind, Result as IoResult},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, Waker},
@@ -141,6 +142,7 @@ struct Control {
     recv_waker: Option<Waker>,
     last_rxtx: Instant,
     polling_thread: Thread,
+    done: bool,
 }
 
 impl Control {
@@ -152,6 +154,7 @@ impl Control {
             recv_waker: None,
             last_rxtx: Instant::now(),
             polling_thread,
+            done: false,
         }
     }
 }
@@ -169,13 +172,29 @@ impl Connection {
     }
 }
 
+impl Drop for Connection {
+    fn drop(&mut self) {
+        let mut control = self.control.lock();
+        control.done = true;
+        if let Some(waker) = control.recv_waker.take() {
+            waker.wake();
+        }
+        if let Some(waker) = control.send_waker.take() {
+            waker.wake();
+        }
+    }
+}
+
 impl AsyncRead for Connection {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    ) -> Poll<IoResult<()>> {
         let mut control = self.control.lock();
+        if control.done {
+            return Err(IoError::from(IoErrorKind::BrokenPipe)).into();
+        }
         if control.recv_buffer.is_empty() {
             if let Some(old_waker) = control.recv_waker.replace(cx.waker().clone()) {
                 if !old_waker.will_wake(cx.waker()) {
@@ -190,17 +209,16 @@ impl AsyncRead for Connection {
         control.last_rxtx = Instant::now();
         // log::info!("unpark in async read");
         control.polling_thread.unpark();
-        Poll::Ready(Ok(()))
+        Ok(()).into()
     }
 }
 
 impl AsyncWrite for Connection {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResult<usize>> {
         let mut control = self.control.lock();
+        if control.done {
+            return Err(IoError::from(IoErrorKind::BrokenPipe)).into();
+        }
         if control.send_buffer.is_full() {
             if let Some(old_waker) = control.send_waker.replace(cx.waker().clone()) {
                 if !old_waker.will_wake(cx.waker()) {
@@ -214,15 +232,15 @@ impl AsyncWrite for Connection {
         control.last_rxtx = Instant::now();
         // log::info!("unpark in async write");
         control.polling_thread.unpark();
-        Poll::Ready(Ok(n))
+        Ok(n).into()
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<IoResult<()>> {
+        Ok(()).into()
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<IoResult<()>> {
+        Ok(()).into()
     }
 }
 
@@ -245,13 +263,12 @@ fn idle_timeout(state: TcpState) -> Duration {
     }
 }
 
-async fn tcp_copy_bidir<A: AsyncRead + AsyncWrite, B: AsyncRead + AsyncWrite>(a: A, b: B) {
-    let (mut a_r, mut a_w) = tokio::io::split(a);
-    let (mut b_r, mut b_w) = tokio::io::split(b);
-    tokio::select!(
-        _ = tokio::io::copy(&mut a_r, &mut b_w) => (),
-        _ = tokio::io::copy(&mut b_r, &mut a_w) => (),
-    );
+async fn tcp_copy_bidir<A, B>(mut a: A, mut b: B)
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
 }
 
 struct TunProxy {
@@ -329,6 +346,18 @@ impl TunProxy {
                     let mut control = connections.get_mut(&handle).unwrap().control.lock();
                     match socket {
                         Socket::Tcp(socket) => {
+                            // log::info!("{} {}", handle, socket.state());
+                            if matches!(
+                                socket.state(),
+                                tcp::State::CloseWait
+                                    | tcp::State::LastAck
+                                    | tcp::State::Closing
+                                    | tcp::State::Closed
+                            ) {
+                                to_removed.push(handle);
+                                continue;
+                            }
+
                             let mut wake_receiver = false;
                             while socket.can_recv() && !control.recv_buffer.is_full() {
                                 wake_receiver = true;
