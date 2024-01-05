@@ -186,8 +186,9 @@ impl AsyncRead for Connection {
         }
         let n = control.recv_buffer.dequeue_slice(buf.initialize_unfilled());
         buf.advance(n);
-        // log::info!("socket => external ({n})");
+        // log::info!("socket => external");
         control.last_rxtx = Instant::now();
+        // log::info!("unpark in async read");
         control.polling_thread.unpark();
         Poll::Ready(Ok(()))
     }
@@ -209,8 +210,9 @@ impl AsyncWrite for Connection {
             return Poll::Pending;
         }
         let n = control.send_buffer.enqueue_slice(buf);
-        // log::info!("external => socket ({n})");
+        // log::info!("external => socket");
         control.last_rxtx = Instant::now();
+        // log::info!("unpark in async write");
         control.polling_thread.unpark();
         Poll::Ready(Ok(n))
     }
@@ -336,7 +338,7 @@ impl TunProxy {
                                 }) else {
                                     break;
                                 };
-                                // log::info!("iface => socket {result:?}");
+                                // log::info!("iface => socket");
                             }
                             if wake_receiver {
                                 if let Some(waker) = control.recv_waker.take() {
@@ -353,7 +355,7 @@ impl TunProxy {
                                 }) else {
                                     break;
                                 };
-                                // log::info!("socket => iface {result:?}");
+                                // log::info!("socket => iface");
                             }
                             if wake_sender {
                                 if let Some(waker) = control.send_waker.take() {
@@ -380,6 +382,7 @@ impl TunProxy {
                 let duration = iface
                     .poll_delay(before_poll, &socket_set.lock())
                     .unwrap_or(SmolDuration::from_millis(1000));
+                // log::info!("sleep {duration}");
                 if duration != SmolDuration::ZERO {
                     thread::park_timeout(duration.into());
                 }
@@ -442,6 +445,7 @@ impl TunProxy {
             tokio::spawn(tcp_copy_bidir(conn, stream));
         }
         self.l3_rx_sender.send(pkt).unwrap();
+        // log::info!("unpark new pkt");
         self.polling_thread.unpark();
     }
 
@@ -477,7 +481,9 @@ fn new_tun() -> Framed<AsyncDevice, TunPacketCodec> {
 #[tokio::main]
 async fn main() {
     let env = env_logger::Env::default().default_filter_or("info");
-    env_logger::Builder::from_env(env).init();
+    env_logger::Builder::from_env(env)
+        .format_timestamp_millis()
+        .init();
     let device = new_tun();
     let mut tun_proxy = TunProxy::new(device);
     tun_proxy.run().await;
